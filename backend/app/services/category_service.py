@@ -7,7 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.category import Category
 from app.models.category_group import CategoryGroup
+from app.models.goal import GoalAllocation
 from app.models.rule import Rule
+from app.models.transaction import Transaction
 from app.schemas.category import CategoryCreate, CategoryUpdate
 from app.services.category_group_service import CATEGORY_TO_GROUP, create_default_groups
 
@@ -217,6 +219,37 @@ async def update_category(
     changes = data.model_dump(exclude_unset=True)
     if changes.get("is_hidden") is True and not category.is_system:
         raise CategoryVisibilityError("Only system categories can be hidden")
+
+    if changes.get("is_ignored") is True:
+        await session.execute(
+            select(Transaction.id)
+            .where(
+                Transaction.workspace_id == workspace_id,
+                Transaction.category_id == category_id,
+                Transaction.id.in_(select(GoalAllocation.transaction_id)),
+            )
+            .order_by(Transaction.id)
+            .with_for_update(of=Transaction)
+        )
+        category = await session.scalar(
+            select(Category)
+            .where(Category.id == category_id, Category.workspace_id == workspace_id)
+            .with_for_update(key_share=True)
+            .execution_options(populate_existing=True)
+        )
+        if not category:
+            return None
+        allocated = await session.scalar(
+            select(GoalAllocation.id)
+            .join(Transaction, Transaction.id == GoalAllocation.transaction_id)
+            .where(
+                Transaction.workspace_id == workspace_id,
+                Transaction.category_id == category_id,
+            )
+            .limit(1)
+        )
+        if allocated:
+            raise ValueError("Remove pocket assignments before ignoring this category")
 
     for key, value in changes.items():
         setattr(category, key, value)
