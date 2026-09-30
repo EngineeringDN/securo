@@ -104,6 +104,58 @@ async def test_ignored_category_change_requires_clearing_assignments(
     assert response.status_code == 200
 
 
+@pytest.mark.parametrize("ignored_destination", [False, True])
+async def test_category_deletion_preserves_pocket_assignments(
+    client, auth_headers, test_account, test_user, session, ignored_destination
+):
+    source = Category(
+        user_id=test_user.id, workspace_id=test_account.workspace_id, name="Source"
+    )
+    destination = Category(
+        user_id=test_user.id,
+        workspace_id=test_account.workspace_id,
+        name="Destination",
+        is_ignored=ignored_destination,
+    )
+    session.add_all([source, destination])
+    await session.commit()
+    source_id, destination_id = source.id, destination.id
+    pocket = await create_pocket(client, auth_headers, test_account)
+    response = await post_transaction(
+        client, auth_headers, test_account, "Deposit", "100", "credit",
+        category_id=source_id, allocations=[(pocket["id"], "100")],
+    )
+    assert response.status_code == 201
+    transaction_id = response.json()["id"]
+
+    response = await client.delete(
+        f"/api/categories/{source_id}", headers=auth_headers,
+        params={"transfer_to_category_id": str(destination_id)},
+    )
+    assert response.status_code == (409 if ignored_destination else 204)
+    if ignored_destination:
+        assert "Ignored transactions" in response.json()["detail"]
+    session.expire_all()
+    assert (await session.get(Category, source_id) is not None) == ignored_destination
+    response = await client.get(f"/api/transactions/{transaction_id}", headers=auth_headers)
+    assert response.json()["category_id"] == str(
+        source_id if ignored_destination else destination_id
+    )
+    assert Decimal(response.json()["goal_allocations"][0]["amount"]) == 100
+
+    if ignored_destination:
+        response = await client.patch(
+            f"/api/transactions/{transaction_id}", headers=auth_headers,
+            json={"goal_allocations": []},
+        )
+        assert response.status_code == 200
+        response = await client.delete(
+            f"/api/categories/{source_id}", headers=auth_headers,
+            params={"transfer_to_category_id": str(destination_id)},
+        )
+        assert response.status_code == 204
+
+
 @pytest.mark.parametrize("apply_all", [False, True])
 async def test_rules_remove_assignments_when_ignoring_a_transaction(
     client,

@@ -1711,6 +1711,8 @@ async def bulk_update_category(
     workspace_id: uuid.UUID,
     transaction_ids: list[uuid.UUID],
     category_id: Optional[uuid.UUID] = None,
+    *,
+    commit: bool = True,
 ) -> int:
     await _ensure_category_in_workspace(session, workspace_id, category_id)
     transactions = list((await session.scalars(
@@ -1729,7 +1731,10 @@ async def bulk_update_category(
     )
     for transaction in transactions:
         await goal_allocation_service.validate_transaction_allocations(session, workspace_id, transaction)
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     return cast(CursorResult, result).rowcount
 
 

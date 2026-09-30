@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.account import Account
+from app.models.category import Category
 from app.models.goal import Goal, GoalAllocation
 from app.models.import_log import ImportLog
 from app.models.transaction import Transaction
@@ -22,7 +23,7 @@ from app.models.user import User
 from app.models.workspace import WorkspaceMember
 from app.schemas.goal import GoalAllocationInput
 from app.schemas.transaction import TransactionImport, TransactionUpdate, TransferCreate
-from app.services import import_service
+from app.services import category_service, import_service
 from app.services.admin_service import delete_user
 from app.services.goal_allocation_service import (
     _transaction_allocations_for_update,
@@ -294,6 +295,52 @@ async def test_transaction_edit_sees_assignments_added_while_waiting(
             == 200
         )
         assert await _pocket_current_amount(fresh, goal.id) == 150
+
+
+async def test_category_transfer_sees_assignments_added_while_waiting(
+    session, postgres_sessions, pocket_state
+):
+    user, workspace, _, goal, transaction = pocket_state
+    source = Category(user_id=user.id, workspace_id=workspace.id, name="Source")
+    destination = Category(
+        user_id=user.id, workspace_id=workspace.id, name="Ignored", is_ignored=True
+    )
+    session.add_all([source, destination])
+    await session.flush()
+    transaction.category_id = source.id
+    await session.commit()
+    source_id, destination_id, transaction_id, goal_id = (
+        source.id, destination.id, transaction.id, goal.id
+    )
+
+    async with postgres_sessions() as stale, postgres_sessions() as writer:
+        cached = await stale.get(Transaction, transaction_id)
+        assert cached.goal_allocations == []
+        pid = await stale.scalar(text("SELECT pg_backend_pid()"))
+        await replace_transaction_allocations(
+            writer, workspace.id, user.id,
+            await writer.get(Transaction, transaction_id),
+            [GoalAllocationInput(goal_id=goal_id, amount=150)],
+        )
+
+        async def transfer():
+            with pytest.raises(ValueError, match="Ignored transactions"):
+                await category_service.delete_category(
+                    stale, source_id, workspace.id, transfer_to_id=destination_id
+                )
+            await stale.rollback()
+
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(transfer())
+            await _wait_for_lock(writer, pid)
+            await writer.commit()
+
+    async with postgres_sessions() as fresh:
+        assert await fresh.get(Category, source_id) is not None
+        assert await fresh.scalar(
+            select(Transaction.category_id).where(Transaction.id == transaction_id)
+        ) == source_id
+        assert await _pocket_current_amount(fresh, goal_id) == 150
 
 
 async def test_deleting_credit_cannot_leave_spent_pocket_negative(session, pocket_state):
